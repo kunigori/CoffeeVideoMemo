@@ -1,0 +1,697 @@
+diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession+Configuration.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession+Configuration.kt
+--- a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession+Configuration.kt
++++ b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession+Configuration.kt
+@@ -262,6 +262,7 @@
+ 
+   // Bind it all together (must be on UI Thread)
+   Log.i(CameraSession.TAG, "Binding ${useCases.size} use-cases...")
++  isExposureLocked = false
+   camera = provider.bindToLifecycle(this, cameraSelector, *useCases.toTypedArray())
+   // Notify callback
+   callback.onInitialized()
+@@ -280,6 +281,7 @@
+       if (isStreaming) {
+         callback.onStarted()
+       } else {
++        isExposureLocked = false
+         callback.onStopped()
+       }
+       lastIsStreaming = isStreaming
+@@ -326,6 +328,7 @@
+     lifecycleRegistry.currentState = Lifecycle.State.STARTED
+     lifecycleRegistry.currentState = Lifecycle.State.RESUMED
+   } else {
++    isExposureLocked = false
+     lifecycleRegistry.currentState = Lifecycle.State.STARTED
+     lifecycleRegistry.currentState = Lifecycle.State.CREATED
+   }
+diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession+Focus.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession+Focus.kt
+--- a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession+Focus.kt
++++ b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession+Focus.kt
+@@ -1,17 +1,40 @@
+ package com.mrousavy.camera.core
+ 
+ import android.annotation.SuppressLint
++import android.hardware.camera2.CameraCharacteristics
++import android.hardware.camera2.CaptureRequest
+ import android.util.Log
++import androidx.annotation.OptIn
++import androidx.camera.camera2.interop.Camera2CameraControl
++import androidx.camera.camera2.interop.Camera2CameraInfo
++import androidx.camera.camera2.interop.CaptureRequestOptions
++import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+ import androidx.camera.core.CameraControl
+ import androidx.camera.core.FocusMeteringAction
+ import androidx.camera.core.MeteringPoint
++import androidx.lifecycle.Lifecycle
+ import com.mrousavy.camera.core.extensions.await
+ 
++class ExposureLockNotSupportedError :
++  CameraError("device", "exposure-lock-not-supported", "The currently selected camera device does not support AE lock!")
++
++class ExposureLockFailedError(locked: Boolean, cause: Throwable? = null) :
++  CameraError(
++    "capture",
++    "exposure-lock-failed",
++    "Failed to ${if (locked) "lock" else "unlock"} auto-exposure on the active camera session!",
++    cause
++  )
++
+ @SuppressLint("RestrictedApi")
+ suspend fun CameraSession.focus(meteringPoint: MeteringPoint) {
+   val camera = camera ?: throw CameraNotReadyError()
+ 
+-  val action = FocusMeteringAction.Builder(meteringPoint).build()
++  val action = if (isExposureLocked) {
++    FocusMeteringAction.Builder(meteringPoint, FocusMeteringAction.FLAG_AF).build()
++  } else {
++    FocusMeteringAction.Builder(meteringPoint).build()
++  }
+   if (!camera.cameraInfo.isFocusMeteringSupported(action)) {
+     throw FocusNotSupportedError()
+   }
+@@ -29,3 +52,45 @@
+     throw FocusCanceledError()
+   }
+ }
++
++@OptIn(ExperimentalCamera2Interop::class)
++fun CameraSession.isExposureLockSupported(): Boolean {
++  val activeCamera = camera ?: throw CameraNotReadyError()
++  if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
++    throw CameraNotReadyError()
++  }
++  val camera2Info = Camera2CameraInfo.from(activeCamera.cameraInfo)
++  val available = camera2Info.getCameraCharacteristic(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE)
++  return available == true
++}
++
++@OptIn(ExperimentalCamera2Interop::class)
++suspend fun CameraSession.setExposureLocked(locked: Boolean): Boolean {
++  val activeCamera = camera ?: throw CameraNotReadyError()
++  if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
++    throw CameraNotReadyError()
++  }
++  if (!isExposureLockSupported()) {
++    throw ExposureLockNotSupportedError()
++  }
++
++  try {
++    val camera2Control = Camera2CameraControl.from(activeCamera.cameraControl)
++    val options = CaptureRequestOptions.Builder()
++      .setCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK, locked)
++      .build()
++
++    camera2Control.addCaptureRequestOptions(options).await(CameraQueues.cameraExecutor)
++    val appliedValue = camera2Control.captureRequestOptions.getCaptureRequestOption(CaptureRequest.CONTROL_AE_LOCK)
++    val confirmed = appliedValue == locked
++    if (!confirmed) {
++      throw ExposureLockFailedError(locked)
++    }
++    isExposureLocked = locked
++    return true
++  } catch (e: CameraError) {
++    throw e
++  } catch (e: Throwable) {
++    throw ExposureLockFailedError(locked, e)
++  }
++}
+diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession.kt
+--- a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession.kt
++++ b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/core/CameraSession.kt
+@@ -60,6 +60,7 @@
+   // Camera State
+   internal val mutex = Mutex()
+   internal var isDestroyed = false
++  internal var isExposureLocked = false
+   internal val lifecycleRegistry = LifecycleRegistry(this)
+   internal var recording: Recording? = null
+   internal var isRecordingCanceled = false
+@@ -84,6 +85,7 @@
+   override fun close() {
+     Log.i(TAG, "Closing CameraSession...")
+     isDestroyed = true
++    isExposureLocked = false
+     orientationManager.stopOrientationUpdates()
+     runOnUiThread {
+       lifecycleRegistry.currentState = Lifecycle.State.DESTROYED
+diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraView+Focus.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraView+Focus.kt
+--- a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraView+Focus.kt
++++ b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraView+Focus.kt
+@@ -4,6 +4,8 @@
+ import com.facebook.react.bridge.ReadableMap
+ import com.mrousavy.camera.core.FocusRequiresPreviewError
+ import com.mrousavy.camera.core.focus
++import com.mrousavy.camera.core.isExposureLockSupported
++import com.mrousavy.camera.core.setExposureLocked
+ import com.mrousavy.camera.core.utils.runOnUiThreadAndWait
+ 
+ suspend fun CameraView.focus(pointMap: ReadableMap) {
+@@ -17,3 +19,7 @@
+   }
+   cameraSession.focus(point)
+ }
++
++fun CameraView.isExposureLockSupported(): Boolean = cameraSession.isExposureLockSupported()
++
++suspend fun CameraView.setExposureLocked(locked: Boolean): Boolean = cameraSession.setExposureLocked(locked)
+diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraView.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraView.kt
+--- a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraView.kt
++++ b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraView.kt
+@@ -25,6 +25,7 @@
+ import com.mrousavy.camera.frameprocessors.Frame
+ import com.mrousavy.camera.frameprocessors.FrameProcessor
+ import com.mrousavy.camera.react.extensions.installHierarchyFitter
++import java.lang.ref.WeakReference
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+@@ -46,6 +47,8 @@
+   FpsSampleCollector.Callback {
+   companion object {
+     const val TAG = "CameraView"
++    @Volatile
++    var activeCameraView: WeakReference<CameraView>? = null
+   }
+ 
+   // react properties
+@@ -118,6 +121,7 @@
+ 
+   init {
+     clipToOutline = true
++    activeCameraView = WeakReference(this)
+     cameraSession = CameraSession(context, this)
+     this.installHierarchyFitter()
+     updatePreview()
+@@ -126,6 +130,7 @@
+   override fun onAttachedToWindow() {
+     Log.i(TAG, "CameraView attached to window!")
+     super.onAttachedToWindow()
++    activeCameraView = WeakReference(this)
+     if (!isMounted) {
+       // Notifies JS view that the native view is now available
+       isMounted = true
+@@ -138,10 +143,16 @@
+   override fun onDetachedFromWindow() {
+     Log.i(TAG, "CameraView detached from window!")
+     super.onDetachedFromWindow()
++    if (activeCameraView?.get() === this) {
++      activeCameraView = null
++    }
+     // stop collecting FPS samples
+     fpsSampleCollector.stop()
+   }
+ 
+   fun destroy() {
++    if (activeCameraView?.get() === this) {
++      activeCameraView = null
++    }
+     cameraSession.close()
+   }
+diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraViewModule.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraViewModule.kt
+--- a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraViewModule.kt
++++ b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraViewModule.kt
+@@ -1,9 +1,15 @@
+ package com.mrousavy.camera.react
+ 
+ import android.Manifest
++import android.content.ContentValues
+ import android.content.pm.PackageManager
++import android.os.Build
++import android.os.Environment
++import android.provider.MediaStore
+ import android.util.Log
+ import androidx.core.content.ContextCompat
++import java.io.File
++import java.io.FileInputStream
+ import com.facebook.react.bridge.Callback
+ import com.facebook.react.bridge.Promise
+ import com.facebook.react.bridge.ReactApplicationContext
+@@ -72,7 +78,9 @@
+       val uiManagerType = if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) UIManagerType.FABRIC else UIManagerType.DEFAULT
+       val uiManager = UIManagerHelper.getUIManager(context, uiManagerType) ?: throw Error("UIManager not found!")
+ 
+-      val view = uiManager.resolveView(viewId) as? CameraView ?: throw ViewNotFoundError(viewId)
++      val view = (if (viewId > 0) uiManager.resolveView(viewId) as? CameraView else null)
++        ?: CameraView.activeCameraView?.get()
++        ?: throw ViewNotFoundError(viewId)
+       Log.d(TAG, "Found view $viewId!")
+       return@runOnUiThreadAndWait view
+     }
+@@ -189,6 +197,93 @@
+     }
+   }
+ 
++  @ReactMethod
++  fun isExposureLockSupported(viewTag: Int, promise: Promise) {
++    backgroundCoroutineScope.launch {
++      withPromise(promise) {
++        val view = findCameraView(viewTag)
++        return@withPromise view.isExposureLockSupported()
++      }
++    }
++  }
++
++  @ReactMethod
++  fun lockExposure(viewTag: Int, promise: Promise) {
++    backgroundCoroutineScope.launch {
++      withPromise(promise) {
++        val view = findCameraView(viewTag)
++        return@withPromise view.setExposureLocked(true)
++      }
++    }
++  }
++
++  @ReactMethod
++  fun unlockExposure(viewTag: Int, promise: Promise) {
++    backgroundCoroutineScope.launch {
++      withPromise(promise) {
++        val view = findCameraView(viewTag)
++        return@withPromise view.setExposureLocked(false)
++      }
++    }
++  }
++
++  @ReactMethod
++  fun saveVideoToPhotoLibrary(filePath: String, promise: Promise) {
++    backgroundCoroutineScope.launch {
++      try {
++        val cleanPath = filePath.removePrefix("file://").trim()
++        val sourceFile = File(cleanPath)
++        if (!sourceFile.exists()) {
++          promise.reject("storage/file-not-found", "録画ファイルが存在しません: $cleanPath")
++          return@launch
++        }
++
++        val resolver = reactApplicationContext.contentResolver
++        val fileName = "CoffeeVideoMemo_${System.currentTimeMillis()}.mp4"
++        val values = ContentValues().apply {
++          put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
++          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
++          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Camera")
++            put(MediaStore.Video.Media.IS_PENDING, 1)
++          }
++        }
++
++        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++          MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
++        } else {
++          MediaStore.Video.Media.EXTERNAL_CONTENT_URI
++        }
++
++        val itemUri = resolver.insert(collection, values)
++        if (itemUri == null) {
++          promise.reject("storage/save-failed", "MediaStoreへのエントリ作成に失敗しました。")
++          return@launch
++        }
++
++        resolver.openOutputStream(itemUri)?.use { outStream ->
++          FileInputStream(sourceFile).use { inStream ->
++            inStream.copyTo(outStream)
++          }
++        } ?: run {
++          promise.reject("storage/save-failed", "保存先ストリームを開けませんでした。")
++          return@launch
++        }
++
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++          val completeValues = ContentValues().apply {
++            put(MediaStore.Video.Media.IS_PENDING, 0)
++          }
++          resolver.update(itemUri, completeValues, null, null)
++        }
++
++        promise.resolve(itemUri.toString())
++      } catch (e: Throwable) {
++        promise.reject("storage/save-failed", e.message ?: "ギャラリーへの動画保存に失敗しました。", e)
++      }
++    }
++  }
++
+   private fun canRequestPermission(permission: String): Boolean {
+     val activity = currentActivity as? PermissionAwareActivity
+     return activity?.shouldShowRequestPermissionRationale(permission) ?: false
+diff --git a/node_modules/react-native-vision-camera/ios/Core/CameraSession+Configuration.swift b/node_modules/react-native-vision-camera/ios/Core/CameraSession+Configuration.swift
+--- a/node_modules/react-native-vision-camera/ios/Core/CameraSession+Configuration.swift
++++ b/node_modules/react-native-vision-camera/ios/Core/CameraSession+Configuration.swift
+@@ -23,6 +23,7 @@
+       captureSession.removeInput(input)
+     }
+     videoDeviceInput = nil
++    isExposureLocked = false
+ 
+     #if targetEnvironment(simulator)
+       // iOS Simulators don't have Cameras
+@@ -282,7 +283,7 @@
+       }
+       device.focusMode = .continuousAutoFocus
+     }
+-    if device.isExposureModeSupported(.continuousAutoExposure) {
++    if !isExposureLocked, device.isExposureModeSupported(.continuousAutoExposure) {
+       if device.isExposurePointOfInterestSupported {
+         device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+       }
+diff --git a/node_modules/react-native-vision-camera/ios/Core/CameraSession+Focus.swift b/node_modules/react-native-vision-camera/ios/Core/CameraSession+Focus.swift
+--- a/node_modules/react-native-vision-camera/ios/Core/CameraSession+Focus.swift
++++ b/node_modules/react-native-vision-camera/ios/Core/CameraSession+Focus.swift
+@@ -35,8 +35,8 @@
+         device.focusMode = .autoFocus
+       }
+ 
+-      // Set Exposure
+-      if device.isExposurePointOfInterestSupported {
++      // Set Exposure (preserve AE lock if active)
++      if !isExposureLocked, device.isExposurePointOfInterestSupported {
+         device.exposurePointOfInterest = point
+         device.exposureMode = .autoExpose
+       }
+@@ -73,8 +73,8 @@
+       device.focusMode = .continuousAutoFocus
+     }
+ 
+-    // Reset Exposure to continuous/auto
+-    if device.isExposurePointOfInterestSupported {
++    // Reset Exposure to continuous/auto only if AE is not locked
++    if !isExposureLocked, device.isExposurePointOfInterestSupported {
+       device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+       device.exposureMode = .continuousAutoExposure
+     }
+@@ -85,4 +85,71 @@
+                                               name: NSNotification.Name.AVCaptureDeviceSubjectAreaDidChange,
+                                               object: nil)
+   }
++
++  /**
++   Checks whether the active AVCaptureDevice in the running session supports `.locked` exposure mode.
++   */
++  func isExposureLockSupported(completion: @escaping (Result<Bool, CameraError>) -> Void) {
++    CameraQueues.cameraQueue.async {
++      guard let device = self.videoDeviceInput?.device else {
++        completion(.failure(.session(.cameraNotReady)))
++        return
++      }
++      let supported = device.isExposureModeSupported(.locked)
++      completion(.success(supported))
++    }
++  }
++
++  /**
++   Locks or unlocks auto-exposure on the active AVCaptureDevice and verifies that exposureMode transitioned.
++   */
++  func setExposureLocked(_ locked: Bool, completion: @escaping (Result<Bool, CameraError>) -> Void) {
++    CameraQueues.cameraQueue.async {
++      guard self.captureSession.isRunning, let device = self.videoDeviceInput?.device else {
++        completion(.failure(.session(.cameraNotReady)))
++        return
++      }
++
++      if locked {
++        guard device.isExposureModeSupported(.locked) else {
++          completion(.failure(.unknown(message: "Exposure lock (.locked) is not supported on this AVCaptureDevice.")))
++          return
++        }
++        do {
++          try device.lockForConfiguration()
++          defer {
++            device.unlockForConfiguration()
++          }
++          device.exposureMode = .locked
++          let applied = device.exposureMode == .locked
++          self.isExposureLocked = applied
++          completion(.success(applied))
++        } catch {
++          completion(.failure(.device(.configureError)))
++        }
++      } else {
++        let targetMode: AVCaptureDevice.ExposureMode
++        if device.isExposureModeSupported(.continuousAutoExposure) {
++          targetMode = .continuousAutoExposure
++        } else if device.isExposureModeSupported(.autoExpose) {
++          targetMode = .autoExpose
++        } else {
++          completion(.failure(.unknown(message: "Auto-exposure mode is not supported on this AVCaptureDevice.")))
++          return
++        }
++        do {
++          try device.lockForConfiguration()
++          defer {
++            device.unlockForConfiguration()
++          }
++          device.exposureMode = targetMode
++          let unlocked = device.exposureMode == targetMode
++          self.isExposureLocked = false
++          completion(.success(unlocked))
++        } catch {
++          completion(.failure(.device(.configureError)))
++        }
++      }
++    }
++  }
+ }
+diff --git a/node_modules/react-native-vision-camera/ios/Core/CameraSession.swift b/node_modules/react-native-vision-camera/ios/Core/CameraSession.swift
+--- a/node_modules/react-native-vision-camera/ios/Core/CameraSession.swift
++++ b/node_modules/react-native-vision-camera/ios/Core/CameraSession.swift
+@@ -33,6 +33,7 @@
+   var recordingSession: RecordingSession?
+   var didCancelRecording = false
+   var orientationManager = OrientationManager()
++  var isExposureLocked = false
+ 
+   // Callbacks
+   weak var delegate: CameraSessionDelegate?
+@@ -253,16 +254,23 @@
+   /**
+    Starts or stops the CaptureSession if needed (`isActive`)
+    */
+   private func checkIsActive(_ configuration: CameraConfiguration) {
+-    if configuration.isActive == captureSession.isRunning {
+-      return
+-    }
+-
+     // Start/Stop session
+     if configuration.isActive {
+-      captureSession.startRunning()
++      if !captureSession.isRunning {
++        captureSession.startRunning()
++      }
+       delegate?.onCameraStarted()
+     } else {
++      isExposureLocked = false
++      if captureSession.isRunning {
++        captureSession.stopRunning()
++        delegate?.onCameraStopped()
++      }
+     }
+   }
+ }
+diff --git a/node_modules/react-native-vision-camera/ios/React/CameraView+Focus.swift b/node_modules/react-native-vision-camera/ios/React/CameraView+Focus.swift
+--- a/node_modules/react-native-vision-camera/ios/React/CameraView+Focus.swift
++++ b/node_modules/react-native-vision-camera/ios/React/CameraView+Focus.swift
+@@ -20,4 +20,26 @@
+       return nil
+     }
+   }
++
++  func isExposureLockSupported(promise: Promise) {
++    cameraSession.isExposureLockSupported { result in
++      switch result {
++      case let .success(supported):
++        promise.resolve(supported)
++      case let .failure(error):
++        promise.reject(error: error)
++      }
++    }
++  }
++
++  func setExposureLocked(_ locked: Bool, promise: Promise) {
++    cameraSession.setExposureLocked(locked) { result in
++      switch result {
++      case let .success(applied):
++        promise.resolve(applied)
++      case let .failure(error):
++        promise.reject(error: error)
++      }
++    }
++  }
+ }
+diff --git a/node_modules/react-native-vision-camera/ios/React/CameraView.swift b/node_modules/react-native-vision-camera/ios/React/CameraView.swift
+--- a/node_modules/react-native-vision-camera/ios/React/CameraView.swift
++++ b/node_modules/react-native-vision-camera/ios/React/CameraView.swift
+@@ -96,6 +96,7 @@
+   #endif
+ 
+   // pragma MARK: Internal Properties
++  static weak var activeCameraView: CameraView?
+   var cameraSession = CameraSession()
+   var previewView: PreviewView?
+   var isMounted = false
+@@ -112,6 +113,7 @@
+ 
+   override public init(frame: CGRect) {
+     super.init(frame: frame)
++    CameraView.activeCameraView = self
+     cameraSession.delegate = self
+     fpsSampleCollector.delegate = self
+     updatePreview()
+@@ -126,11 +128,15 @@
+     super.willMove(toSuperview: newSuperview)
+ 
+     if newSuperview != nil {
++      CameraView.activeCameraView = self
+       fpsSampleCollector.start()
+       if !isMounted {
+         isMounted = true
+         onViewReadyEvent?(nil)
+       }
+     } else {
++      if CameraView.activeCameraView === self {
++        CameraView.activeCameraView = nil
++      }
+       fpsSampleCollector.stop()
+     }
+   }
+diff --git a/node_modules/react-native-vision-camera/ios/React/CameraViewManager.m b/node_modules/react-native-vision-camera/ios/React/CameraViewManager.m
+--- a/node_modules/react-native-vision-camera/ios/React/CameraViewManager.m
++++ b/node_modules/react-native-vision-camera/ios/React/CameraViewManager.m
+@@ -103,5 +103,21 @@
+                   : (NSDictionary*)point resolve
+                   : (RCTPromiseResolveBlock)resolve reject
+                   : (RCTPromiseRejectBlock)reject);
++RCT_EXTERN_METHOD(isExposureLockSupported
++                  : (nullable NSNumber*)node resolve
++                  : (RCTPromiseResolveBlock)resolve reject
++                  : (RCTPromiseRejectBlock)reject);
++RCT_EXTERN_METHOD(lockExposure
++                  : (nullable NSNumber*)node resolve
++                  : (RCTPromiseResolveBlock)resolve reject
++                  : (RCTPromiseRejectBlock)reject);
++RCT_EXTERN_METHOD(unlockExposure
++                  : (nullable NSNumber*)node resolve
++                  : (RCTPromiseResolveBlock)resolve reject
++                  : (RCTPromiseRejectBlock)reject);
++RCT_EXTERN_METHOD(saveVideoToPhotoLibrary
++                  : (nonnull NSString*)filePath resolve
++                  : (RCTPromiseResolveBlock)resolve reject
++                  : (RCTPromiseRejectBlock)reject);
+ 
+ @end
+diff --git a/node_modules/react-native-vision-camera/ios/React/CameraViewManager.swift b/node_modules/react-native-vision-camera/ios/React/CameraViewManager.swift
+--- a/node_modules/react-native-vision-camera/ios/React/CameraViewManager.swift
++++ b/node_modules/react-native-vision-camera/ios/React/CameraViewManager.swift
+@@ -11,6 +11,7 @@
+ import AVFoundation
+ import CoreLocation
+ import Foundation
++import Photos
+ 
+ @objc(CameraViewManager)
+ final class CameraViewManager: RCTViewManager {
+@@ -97,6 +98,89 @@
+   }
+ 
+   @objc
++  final func isExposureLockSupported(_ node: NSNumber?, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
++    let promise = Promise(resolver: resolve, rejecter: reject)
++    guard let component = resolveCameraView(withTag: node) else {
++      promise.reject(error: .session(.cameraNotReady))
++      return
++    }
++    component.isExposureLockSupported(promise: promise)
++  }
++
++  @objc
++  final func lockExposure(_ node: NSNumber?, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
++    let promise = Promise(resolver: resolve, rejecter: reject)
++    guard let component = resolveCameraView(withTag: node) else {
++      promise.reject(error: .session(.cameraNotReady))
++      return
++    }
++    component.setExposureLocked(true, promise: promise)
++  }
++
++  @objc
++  final func unlockExposure(_ node: NSNumber?, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
++    let promise = Promise(resolver: resolve, rejecter: reject)
++    guard let component = resolveCameraView(withTag: node) else {
++      promise.reject(error: .session(.cameraNotReady))
++      return
++    }
++    component.setExposureLocked(false, promise: promise)
++  }
++
++  @objc
++  final func saveVideoToPhotoLibrary(_ filePath: NSString, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
++    let rawPath = filePath as String
++    let fileURL: URL
++    if rawPath.hasPrefix("file://"), let parsed = URL(string: rawPath) {
++      fileURL = parsed
++    } else {
++      fileURL = URL(fileURLWithPath: rawPath)
++    }
++
++    guard FileManager.default.fileExists(atPath: fileURL.path) else {
++      reject("storage/file-not-found", "保存対象の一時動画ファイルが見つかりません: \(fileURL.path)", nil)
++      return
++    }
++
++    let performSave = {
++      var localIdentifier: String?
++      PHPhotoLibrary.shared().performChanges({
++        let request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: fileURL)
++        localIdentifier = request?.placeholderForCreatedAsset?.localIdentifier
++      }) { success, error in
++        if success {
++          if let id = localIdentifier {
++            resolve("ph://\(id)")
++          } else {
++            resolve(fileURL.path)
++          }
++        } else {
++          let message = error?.localizedDescription ?? "iPhone写真ライブラリへの動画保存に失敗しました。"
++          reject("storage/save-failed", message, error)
++        }
++      }
++    }
++
++    if #available(iOS 14, *) {
++      PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
++        if status == .authorized || status == .limited {
++          performSave()
++        } else {
++          reject("permission/photo-library-denied", "写真ライブラリへの追加権限が許可されていません。設定アプリから「写真」の権限を許可してください。", nil)
++        }
++      }
++    } else {
++      PHPhotoLibrary.requestAuthorization { status in
++        if status == .authorized {
++          performSave()
++        } else {
++          reject("permission/photo-library-denied", "写真ライブラリへのアクセス権限が許可されていません。", nil)
++        }
++      }
++    }
++  }
++
++  @objc
+   final func getCameraPermissionStatus() -> String {
+     let status = AVCaptureDevice.authorizationStatus(for: .video)
+     return status.descriptor
+@@ -147,7 +231,17 @@
+ 
+   // MARK: Private
+ 
++  func resolveCameraView(withTag tag: NSNumber?) -> CameraView? {
++    if let tag, tag.intValue > 0, let view = bridge?.uiManager?.view(forReactTag: tag) as? CameraView {
++      return view
++    }
++    return CameraView.activeCameraView
++  }
++
+   func getCameraView(withTag tag: NSNumber) -> CameraView {
++    if let view = resolveCameraView(withTag: tag) {
++      return view
++    }
+     // swiftlint:disable force_cast
+     return bridge.uiManager.view(forReactTag: tag) as! CameraView
+     // swiftlint:enable force_cast
