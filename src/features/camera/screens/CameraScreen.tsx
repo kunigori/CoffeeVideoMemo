@@ -8,22 +8,33 @@ import {
 } from 'react-native';
 import { Camera } from 'react-native-vision-camera';
 import { BottomBrewHud } from '../components/BottomBrewHud';
-import {
-  CameraToolColumn,
-  FlyoutType,
-} from '../components/CameraToolColumn';
+import type { FlyoutType } from '../components/CameraToolColumn';
 import { MainNavRail, MainNavTab } from '../components/MainNavRail';
 import { OptionFlyoutOverlay } from '../components/OptionFlyoutOverlay';
+import { PlacementGuideOverlay } from '../components/PlacementGuideOverlay';
 import { TopStatusHud } from '../components/TopStatusHud';
 import {
+  AUDIO_MONITOR_BAR_HEIGHTS,
+  BREW_SEQUENCE_STAGES,
+  BREW_THEME,
   CaptureWorkflowMode,
   RECORDING_TIMER_INTERVAL_MS,
-  SHUTTER_SPEED_OPTIONS,
   ShutterSpeedLabel,
   TARGET_FPS,
 } from '../constants';
 import { useCameraConfig } from '../hooks/useCameraConfig';
 import { useExposureLock } from '../hooks/useExposureLock';
+import { useTimemoreScale } from '../hooks/useTimemoreScale';
+import {
+  BeanOcrSessionResult,
+  captureAndRecognizeBeanInfo,
+} from '../services/beanOcrService';
+import {
+  checkPatternAEquipmentModels,
+  createInitialEquipmentSnapshot,
+  EquipmentInferenceSnapshot,
+  hasNativeEquipmentStatusBridge,
+} from '../services/equipmentInferenceService';
 import { resetExposureLockAdapter } from '../services/exposureLockService';
 import {
   calculateElapsedMs,
@@ -42,12 +53,14 @@ export function CameraScreen(): React.JSX.Element {
   const recordingStartMonotonicRef = useRef<number | null>(null);
   const timerIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Blackmagic Camera 準拠 UI 状態
+  // COFFEE VIDEO MEMO — Brew Motion System (pour_frame_side_view_edition (2).html 準拠) UI 状態
   const [activeNavTab, setActiveNavTab] = useState<MainNavTab>('camera');
   const [activeFlyout, setActiveFlyout] = useState<FlyoutType>(null);
   const [captureMode, setCaptureMode] =
     useState<CaptureWorkflowMode>('full-process');
-  const [exposureEv, setExposureEv] = useState<number>(0.0);
+  const [activeStageIndex, setActiveStageIndex] = useState<0 | 1 | 2>(0);
+  const [showPlacementGuide, setShowPlacementGuide] = useState<boolean>(true);
+  const [exposureEv] = useState<number>(0.0);
   const [shutterSpeed, setShutterSpeed] = useState<ShutterSpeedLabel>('1/60');
 
   // 録画・タイムコード状態
@@ -58,10 +71,19 @@ export function CameraScreen(): React.JSX.Element {
     useState<RecordedVideoInfo | null>(null);
   const [recordingError, setRecordingError] = useState<string | null>(null);
 
+  // 右枠（豆袋）OCR推論結果 & パターンA（左:ミル / 中央:ドリッパー）TFLiteモデル状態
+  const [beanOcrResult, setBeanOcrResult] =
+    useState<BeanOcrSessionResult | null>(null);
+  const [equipmentSnapshot, setEquipmentSnapshot] =
+    useState<EquipmentInferenceSnapshot>(() =>
+      createInitialEquipmentSnapshot(),
+    );
+
   const recordingStatusRef = useRef<RecordingStatus>(recordingStatus);
   recordingStatusRef.current = recordingStatus;
 
   useEffect(() => {
+    let isMounted = true;
     resetExposureLockAdapter(() => {
       try {
         const cam = cameraRef.current as unknown as { handle?: number } | null;
@@ -74,7 +96,19 @@ export function CameraScreen(): React.JSX.Element {
       }
     });
     setVideoPersistenceAdapter(createNativePhotoLibraryPersistenceAdapter());
+    if (hasNativeEquipmentStatusBridge()) {
+      checkPatternAEquipmentModels()
+        .then(snapshot => {
+          if (isMounted) {
+            setEquipmentSnapshot(snapshot);
+          }
+        })
+        .catch(() => {
+          // モデル未配置・初期化前エラーは snapshot 内で通知
+        });
+    }
     return () => {
+      isMounted = false;
       resetExposureLockAdapter();
       setVideoPersistenceAdapter(null);
     };
@@ -109,6 +143,17 @@ export function CameraScreen(): React.JSX.Element {
     isSessionActive: isCameraActive && isInitialized,
     deviceId: device?.id,
   });
+
+  const {
+    connectionState: scaleConnectionState,
+    diagnosticMessage: scaleDiagnosticMessage,
+    uiSnapshot: scaleSnapshot,
+    pourMarkers: scalePourMarkers,
+    handleExtractionCardPress,
+    beginRecordingSync,
+    markPourStage,
+    finishRecordingSync,
+  } = useTimemoreScale();
 
   // デバイスが許容する露出補正範囲内にクランプ（-2.0 〜 +2.0）
   const clampedExposure = useMemo(() => {
@@ -185,21 +230,59 @@ export function CameraScreen(): React.JSX.Element {
     [],
   );
 
-  const handleCycleShutterSpeed = useCallback(() => {
-    setShutterSpeed(prev => {
-      const idx = SHUTTER_SPEED_OPTIONS.indexOf(prev);
-      const nextIdx = (idx + 1) % SHUTTER_SPEED_OPTIONS.length;
-      return SHUTTER_SPEED_OPTIONS[nextIdx] ?? '1/60';
-    });
-  }, []);
+  const handleSelectStage = useCallback(
+    (nextIndex: 0 | 1 | 2) => {
+      setActiveStageIndex(nextIndex);
+      markPourStage((nextIndex + 1) as 1 | 2 | 3);
+    },
+    [markPourStage],
+  );
 
-  const handleToggleAeLock = useCallback(async () => {
+  const handleCycleBrewPhase = useCallback(() => {
+    setActiveStageIndex(prev => {
+      const next = ((prev + 1) % 3) as 0 | 1 | 2;
+      markPourStage((next + 1) as 1 | 2 | 3);
+      return next;
+    });
+  }, [markPourStage]);
+
+  const handleSelectAutoBrightness = useCallback(async () => {
     if (aeLockState === 'locked') {
       await unlockAe();
-    } else {
+    }
+  }, [aeLockState, unlockAe]);
+
+  const handleSelectLockBrightness = useCallback(async () => {
+    if (aeLockState !== 'locked') {
       await lockAe();
     }
-  }, [aeLockState, lockAe, unlockAe]);
+  }, [aeLockState, lockAe]);
+
+  const handleTriggerBeanScan = useCallback(async () => {
+    const cam = cameraRef.current as unknown as {
+      takePhoto?: (options?: Record<string, unknown>) => Promise<{
+        path: string;
+        width?: number;
+        height?: number;
+      }>;
+    } | null;
+
+    if (!cam || typeof cam.takePhoto !== 'function') {
+      return;
+    }
+
+    setBeanOcrResult({
+      state: 'scanning',
+      engine: null,
+      photoPath: null,
+      rawLines: [],
+      matchOutput: null,
+      errorMessage: null,
+    });
+
+    const result = await captureAndRecognizeBeanInfo(cam);
+    setBeanOcrResult(result);
+  }, []);
 
   const handleToggleRecording = useCallback(async () => {
     const currentStatus = recordingStatusRef.current;
@@ -253,14 +336,22 @@ export function CameraScreen(): React.JSX.Element {
             clearElapsedTimer();
             recordingStartMonotonicRef.current = null;
             setElapsedMs(info.measuredDurationMs);
+            const scaleTelemetryLog = finishRecordingSync();
+            const enrichedInfo: RecordedVideoInfo = {
+              ...info,
+              scaleTelemetryLog,
+            };
             // まず一時保存（temporary）として記録し、直後に端末の写真フォルダへ永続保存する
-            setLastRecordedVideo(info);
+            setLastRecordedVideo(enrichedInfo);
             setRecordingStatus('completed');
             setRecordingError(null);
 
-            persistRecordedVideo(info)
+            persistRecordedVideo(enrichedInfo)
               .then(persistedInfo => {
-                setLastRecordedVideo(persistedInfo);
+                setLastRecordedVideo({
+                  ...persistedInfo,
+                  scaleTelemetryLog,
+                });
               })
               .catch(err => {
                 const message =
@@ -273,6 +364,7 @@ export function CameraScreen(): React.JSX.Element {
           onError: error => {
             clearElapsedTimer();
             recordingStartMonotonicRef.current = null;
+            finishRecordingSync();
             setRecordingStatus('error');
             setRecordingError(`[${error.code}] ${error.message}`);
           },
@@ -281,6 +373,14 @@ export function CameraScreen(): React.JSX.Element {
 
       setRecordingStatus('recording');
       startElapsedTimer(startedAtMonotonicMs);
+      beginRecordingSync(startedAtMonotonicMs, Date.now());
+
+      // フル工程モードのREC開始時に、右領域（豆袋枠）の高解像度静止画1枚を撮影してOCR・銘柄推論を非同期実行する
+      if (captureMode === 'full-process') {
+        handleTriggerBeanScan().catch(() => {
+          // OCR失敗時は30fps動画録画自体を止めず、BottomBrewHud枠内にのみ診断を表示する
+        });
+      }
     } catch (err) {
       clearElapsedTimer();
       recordingStartMonotonicRef.current = null;
@@ -297,6 +397,10 @@ export function CameraScreen(): React.JSX.Element {
     lockAe,
     clearElapsedTimer,
     startElapsedTimer,
+    captureMode,
+    handleTriggerBeanScan,
+    beginRecordingSync,
+    finishRecordingSync,
   ]);
 
   const isRecording =
@@ -310,29 +414,66 @@ export function CameraScreen(): React.JSX.Element {
       aeLockState === 'locked' ||
       aeLockState === 'error');
 
-  return (
-    <View style={styles.rootLandscapeRow}>
-      {/* 1列目（最端）: MainNavRail（幅 約64px） */}
-      <MainNavRail activeTab={activeNavTab} onSelectTab={setActiveNavTab} />
+  const currentStage =
+    BREW_SEQUENCE_STAGES[activeStageIndex] ?? BREW_SEQUENCE_STAGES[0];
 
-      {/* 2列目: CameraToolColumn（幅 約76px） */}
-      <CameraToolColumn
-        captureMode={captureMode}
-        activeFlyout={activeFlyout}
+  return (
+    <View style={styles.appRoot}>
+      {/* TOP HEADER: Brand + Timer + Synchronized Camera Specs */}
+      <TopStatusHud
+        elapsedMs={elapsedMs}
         isRecording={isRecording}
-        isStopping={isStopping}
-        canRecord={canRecord30Fps && targetFps === TARGET_FPS}
+        activeStageIndex={activeStageIndex}
+        shutterSpeed={shutterSpeed}
         aeLockState={aeLockState}
-        exposureEv={exposureEv}
-        onToggleFlyout={handleToggleFlyout}
-        onToggleRecording={handleToggleRecording}
+        videoWidth={selectedFormat?.videoWidth}
+        videoHeight={selectedFormat?.videoHeight}
+        onCycleBrewPhase={handleCycleBrewPhase}
+        onPressBrightnessBadge={() => handleToggleFlyout('bright')}
+        onPressFlickerBadge={() => handleToggleFlyout('flicker')}
       />
 
-      {/* 3列目（メイン領域）: 16:9 カメラプレビュー ＋ オーバーレイHUD */}
-      <View style={styles.mainViewportArea}>
-        {/* 16:9 アスペクト比のプレビューフレーム */}
-        <View style={styles.previewStage}>
-          <View style={styles.aspectFrame16by9}>
+      {/* MAIN WORKSPACE: Single Left Rail + Center Monitor + Right Inspector */}
+      <View style={styles.workspace}>
+        {/* 1. SINGLE LEFT RAIL (カメラ, MEDIA, RECORD, MAP, 設定 + MODE, BRIGHT, FLICKER + REC) */}
+        <MainNavRail
+          activeTab={activeNavTab}
+          captureMode={captureMode}
+          activeFlyout={activeFlyout}
+          aeLockState={aeLockState}
+          shutterSpeed={shutterSpeed}
+          isRecording={isRecording}
+          isStopping={isStopping}
+          canRecord={canRecord30Fps && targetFps === TARGET_FPS}
+          onSelectTab={setActiveNavTab}
+          onToggleFlyout={handleToggleFlyout}
+          onToggleRecording={handleToggleRecording}
+        />
+
+        {/* 2. CENTER VIEWFINDER (SIDE-VIEW DRIPPER) + BOTTOM 3 DATA CARDS */}
+        <View style={styles.centerColumn}>
+          <View style={styles.monitorHead}>
+            <Text style={styles.overlineText} numberOfLines={1}>
+              <Text style={styles.overlineBold}>01</Text>
+              {'  /  LIVE MONITOR  ——  SIDE-VIEW BREW SESSION'}
+            </Text>
+
+            <View style={styles.headRight}>
+              <View style={styles.microStatusRow}>
+                <View style={styles.liveDot} />
+                {isRecording ? (
+                  <Text style={styles.microRecPrefix}>REC / </Text>
+                ) : null}
+                <Text style={styles.microText}>TFLite / OCR READY</Text>
+              </View>
+              <View style={styles.shotCounter}>
+                <Text style={styles.shotCounterText}>SHOT 001</Text>
+              </View>
+            </View>
+          </View>
+
+          {/* Viewfinder Stage */}
+          <View style={styles.viewfinder}>
             {hasCameraPermission && device && selectedFormat ? (
               <Camera
                 ref={cameraRef}
@@ -345,6 +486,7 @@ export function CameraScreen(): React.JSX.Element {
                 lowLightBoost={false}
                 videoHdr={false}
                 isActive={isCameraActive}
+                photo={true}
                 video={true}
                 audio={hasMicrophonePermission}
                 onInitialized={onCameraInitialized}
@@ -353,42 +495,35 @@ export function CameraScreen(): React.JSX.Element {
                 onError={onCameraError}
               />
             ) : (
-              <View style={styles.previewFallback}>
-                <Text style={styles.previewFallbackTitle}>{statusMessage}</Text>
+              <View style={styles.viewfinderFallback}>
+                <Text style={styles.fallbackTitle}>{statusMessage}</Text>
                 {blockingReason ? (
-                  <Text style={styles.previewFallbackBody}>
-                    {blockingReason}
-                  </Text>
+                  <Text style={styles.fallbackBody}>{blockingReason}</Text>
                 ) : null}
               </View>
             )}
-          </View>
-        </View>
 
-        {/* HUD オーバーレイ層（TopStatusHud / OptionFlyoutOverlay / BottomBrewHud） */}
-        <View style={styles.hudOverlayLayer} pointerEvents="box-none">
-          <TopStatusHud
-            elapsedMs={elapsedMs}
-            isRecording={isRecording}
-            shutterSpeed={shutterSpeed}
-            aeLockState={aeLockState}
-            exposureEv={exposureEv}
-            videoWidth={selectedFormat?.videoWidth}
-            videoHeight={selectedFormat?.videoHeight}
-            onCycleShutterSpeed={handleCycleShutterSpeed}
-          />
+            <PlacementGuideOverlay
+              visible={showPlacementGuide}
+              captureMode={captureMode}
+              isRecording={isRecording}
+              videoWidth={selectedFormat?.videoWidth}
+              videoHeight={selectedFormat?.videoHeight}
+            />
 
-          <View style={styles.middleOverlayZone} pointerEvents="box-none">
             <OptionFlyoutOverlay
               activeFlyout={activeFlyout}
               captureMode={captureMode}
+              showPlacementGuide={showPlacementGuide}
               aeLockState={aeLockState}
-              exposureEv={exposureEv}
               shutterSpeed={shutterSpeed}
               canOperateAeLock={canOperateAeLock}
               onSelectCaptureMode={mode => setCaptureMode(mode)}
-              onToggleAeLock={handleToggleAeLock}
-              onSelectExposureEv={ev => setExposureEv(ev)}
+              onTogglePlacementGuide={() =>
+                setShowPlacementGuide(prev => !prev)
+              }
+              onSelectAutoBrightness={handleSelectAutoBrightness}
+              onSelectLockBrightness={handleSelectLockBrightness}
               onSelectShutterSpeed={shutter => setShutterSpeed(shutter)}
               onClose={() => setActiveFlyout(null)}
             />
@@ -412,20 +547,22 @@ export function CameraScreen(): React.JSX.Element {
                     : '未選択'}
                 </Text>
                 <Text style={styles.settingsItem}>
-                  ・フリッカー対策シャッター表記: {shutterSpeed} (50Hz/60Hz対応)
+                  ・フリッカー対策シャッター: {shutterSpeed} / AEロック状態:{' '}
+                  {aeLockState}
                 </Text>
                 <Text style={styles.settingsItem}>
-                  ・露出制御: EV {exposureEv >= 0 ? `+${exposureEv.toFixed(1)}` : exposureEv.toFixed(1)} / AEロック状態: {aeLockState}
-                </Text>
-                <Text style={styles.settingsItem}>
-                  ・保存先: 端末のデフォルト「写真」フォルダ（PHPhotoLibrary / MediaStore）
+                  ・保存先: 端末のデフォルト「写真」フォルダ（PHPhotoLibrary /
+                  MediaStore）
                 </Text>
               </View>
             ) : null}
           </View>
 
+          {/* Bottom 3 Data Cards */}
           <BottomBrewHud
             captureMode={captureMode}
+            activeStageIndex={activeStageIndex}
+            shutterSpeed={shutterSpeed}
             cameraStatus={status}
             cameraStatusMessage={statusMessage}
             blockingReason={blockingReason}
@@ -435,9 +572,129 @@ export function CameraScreen(): React.JSX.Element {
             canStartAutoPourDetection={canStartAutoPourDetection}
             lastRecordedVideo={lastRecordedVideo}
             recordingError={recordingError}
+            beanOcrResult={beanOcrResult}
+            equipmentSnapshot={equipmentSnapshot}
+            scaleConnectionState={scaleConnectionState}
+            scaleSnapshot={scaleSnapshot}
+            scaleDiagnosticMessage={scaleDiagnosticMessage}
+            scalePourMarkers={scalePourMarkers}
+            onTriggerBeanScan={handleTriggerBeanScan}
+            onPressExtractionCard={handleExtractionCardPress}
             onRequestPermissions={requestPermissions}
             onRetryCamera={retryCamera}
           />
+        </View>
+
+        {/* 3. RIGHT INSPECTOR: BREW SEQUENCE + OVERLAY + AUDIO MONITOR */}
+        <View style={styles.inspector}>
+          <View style={styles.inspHead}>
+            <Text style={styles.inspSub}>BREW SEQUENCE</Text>
+            <View style={styles.inspSessionRow}>
+              <Text style={styles.inspSessionNum}>{currentStage.stepNum}</Text>
+              <Text style={styles.inspSessionTotal}>/ 03 STAGES</Text>
+            </View>
+            <View style={styles.progressTrack}>
+              <View
+                style={[
+                  styles.progressFill,
+                  { width: `${currentStage.progressPercent}%` },
+                ]}
+              />
+            </View>
+          </View>
+
+          <View style={styles.inspBody}>
+            <Text style={styles.inspSectionLabel}>CURRENT PHASE</Text>
+
+            {BREW_SEQUENCE_STAGES.map((stage, idx) => {
+              const isActive = idx === activeStageIndex;
+              const isDone = idx < activeStageIndex;
+              const isLast = idx === BREW_SEQUENCE_STAGES.length - 1;
+
+              return (
+                <TouchableOpacity
+                  key={stage.stepNum}
+                  accessibilityRole="button"
+                  accessibilityLabel={stage.title}
+                  activeOpacity={0.78}
+                  style={styles.stepRow}
+                  onPress={() => handleSelectStage(stage.index)}>
+                  {!isLast ? <View style={styles.stepConnectorLine} /> : null}
+                  <View
+                    style={[
+                      styles.stepNumCircle,
+                      isActive && styles.stepNumCircleActive,
+                      isDone && styles.stepNumCircleDone,
+                    ]}>
+                    <Text
+                      style={[
+                        styles.stepNumText,
+                        isActive && styles.stepNumTextActive,
+                        isDone && styles.stepNumTextDone,
+                      ]}>
+                      {stage.stepNum}
+                    </Text>
+                  </View>
+
+                  <View style={styles.stepTextBlock}>
+                    <Text
+                      style={[
+                        styles.stepTitle,
+                        isActive && styles.stepTitleActive,
+                      ]}
+                      numberOfLines={1}>
+                      {stage.title}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.stepSub,
+                        isActive && styles.stepSubActive,
+                      ]}
+                      numberOfLines={2}>
+                      {stage.sub}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+
+          <View style={styles.inspBottom}>
+            <View style={styles.utilityRow}>
+              <Text style={styles.inspBottomLabel}>OVERLAY</Text>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="ガイド表示切替"
+                activeOpacity={0.8}
+                style={styles.guideToggleButton}
+                onPress={() => setShowPlacementGuide(prev => !prev)}>
+                <Text style={styles.guideToggleButtonText}>
+                  {showPlacementGuide ? 'GUIDES ON' : 'GUIDES OFF'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            <Text style={styles.inspBottomLabel}>AUDIO MONITOR</Text>
+            <View style={styles.frequencyRow}>
+              {AUDIO_MONITOR_BAR_HEIGHTS.slice(0, 24).map((barH, i) => (
+                <View
+                  key={i}
+                  style={[
+                    styles.frequencyBar,
+                    {
+                      height: Math.max(3, Math.round(barH * 0.65)),
+                      opacity: Number((0.35 + 0.55 * (barH / 35)).toFixed(2)),
+                    },
+                  ]}
+                />
+              ))}
+            </View>
+
+            <View style={styles.audioStatusRow}>
+              <Text style={styles.audioStatusLeft}>INPUT  /  CH 01</Text>
+              <Text style={styles.audioStatusRight}>−18 dB</Text>
+            </View>
+          </View>
         </View>
       </View>
     </View>
@@ -445,100 +702,332 @@ export function CameraScreen(): React.JSX.Element {
 }
 
 const styles = StyleSheet.create({
-  rootLandscapeRow: {
+  appRoot: {
+    flex: 1,
+    flexDirection: 'column',
+    backgroundColor: BREW_THEME.ink,
+  },
+  workspace: {
     flex: 1,
     flexDirection: 'row',
-    backgroundColor: '#080808',
+    minHeight: 0,
   },
-  mainViewportArea: {
+  centerColumn: {
     flex: 1,
-    backgroundColor: '#080808',
-    position: 'relative',
-  },
-  previewStage: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    left: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#080808',
-  },
-  aspectFrame16by9: {
-    width: '100%',
-    height: '100%',
-    maxWidth: '100%',
-    maxHeight: '100%',
-    aspectRatio: 16 / 9,
-    backgroundColor: '#000000',
-    overflow: 'hidden',
-  },
-  previewFallback: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 24,
-    gap: 8,
-  },
-  previewFallbackTitle: {
-    color: '#e5e5ea',
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  previewFallbackBody: {
-    color: '#8e8e93',
-    fontSize: 12,
-    textAlign: 'center',
-  },
-  hudOverlayLayer: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    left: 0,
+    minWidth: 0,
+    paddingHorizontal: 14,
+    backgroundColor: BREW_THEME.centerBg,
     justifyContent: 'space-between',
   },
-  middleOverlayZone: {
+  monitorHead: {
+    height: 36,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  overlineText: {
+    color: BREW_THEME.soft,
+    fontSize: 8.5,
+    fontWeight: '800',
+    letterSpacing: 1.4,
+  },
+  overlineBold: {
+    color: BREW_THEME.oatmeal,
+    fontWeight: '800',
+  },
+  headRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  microStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  liveDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: BREW_THEME.acid,
+    marginRight: 6,
+  },
+  microRecPrefix: {
+    color: BREW_THEME.verm,
+    fontSize: 8.5,
+    fontWeight: '800',
+    letterSpacing: 0.8,
+  },
+  microText: {
+    color: BREW_THEME.oatmeal,
+    fontSize: 8.5,
+    fontWeight: '700',
+    letterSpacing: 0.8,
+  },
+  shotCounter: {
+    backgroundColor: BREW_THEME.oatmeal,
+    borderWidth: 1,
+    borderColor: BREW_THEME.oatmealEdge,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 2,
+  },
+  shotCounterText: {
+    color: BREW_THEME.oatmealInk,
+    fontSize: 8.5,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+  viewfinder: {
     flex: 1,
+    minHeight: 140,
+    borderWidth: 1,
+    borderColor: BREW_THEME.edge,
+    backgroundColor: '#241c16',
+    overflow: 'hidden',
     position: 'relative',
+  },
+  viewfinderFallback: {
+    flex: 1,
+    alignItems: 'center',
     justifyContent: 'center',
+    padding: 20,
+    gap: 6,
+    backgroundColor: '#241c16',
+  },
+  fallbackTitle: {
+    color: BREW_THEME.oatmeal,
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  fallbackBody: {
+    color: BREW_THEME.soft,
+    fontSize: 11,
+    textAlign: 'center',
   },
   settingsOverlayCard: {
+    position: 'absolute',
     alignSelf: 'center',
-    width: '72%',
-    backgroundColor: 'rgba(15, 15, 18, 0.94)',
+    top: 16,
+    width: '78%',
+    backgroundColor: 'rgba(33, 26, 21, 0.96)',
     borderWidth: 1,
-    borderColor: '#2b84ea',
-    borderRadius: 10,
-    padding: 16,
-    gap: 8,
+    borderColor: BREW_THEME.cobalt,
+    borderRadius: 8,
+    padding: 14,
+    gap: 6,
+    zIndex: 30,
   },
   settingsHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 4,
+    marginBottom: 2,
   },
   settingsTitle: {
-    color: '#4da3ff',
-    fontSize: 12,
+    color: BREW_THEME.oatmeal,
+    fontSize: 11,
     fontWeight: '800',
     letterSpacing: 0.6,
   },
   settingsCloseBtn: {
-    backgroundColor: '#2b84ea',
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: 6,
+    backgroundColor: BREW_THEME.cobalt,
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 4,
   },
   settingsCloseText: {
     color: '#ffffff',
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '700',
   },
   settingsItem: {
-    color: '#e5e5ea',
-    fontSize: 12,
+    color: BREW_THEME.ivory,
+    fontSize: 11,
+  },
+  inspector: {
+    width: 196,
+    backgroundColor: BREW_THEME.panel,
+    borderLeftWidth: 1,
+    borderLeftColor: BREW_THEME.edge,
+    justifyContent: 'space-between',
+  },
+  inspHead: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: BREW_THEME.edge,
+    backgroundColor: BREW_THEME.inspHeadBg,
+  },
+  inspSub: {
+    color: BREW_THEME.soft,
+    fontSize: 8.5,
+    fontWeight: '800',
+    letterSpacing: 1.5,
+  },
+  inspSessionRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    marginTop: 4,
+  },
+  inspSessionNum: {
+    color: BREW_THEME.oatmeal,
+    fontSize: 24,
+    fontWeight: '800',
+    letterSpacing: -0.5,
+  },
+  inspSessionTotal: {
+    color: BREW_THEME.soft,
+    fontSize: 9.5,
+    fontWeight: '700',
+    letterSpacing: 0.7,
+    marginLeft: 6,
+  },
+  progressTrack: {
+    marginTop: 8,
+    height: 3,
+    backgroundColor: BREW_THEME.edge,
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    backgroundColor: BREW_THEME.cobalt,
+  },
+  inspBody: {
+    flex: 1,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+  },
+  inspSectionLabel: {
+    color: BREW_THEME.soft,
+    fontSize: 8.5,
+    fontWeight: '800',
+    letterSpacing: 1.5,
+    marginBottom: 10,
+  },
+  stepRow: {
+    position: 'relative',
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    paddingBottom: 12,
+  },
+  stepConnectorLine: {
+    position: 'absolute',
+    top: 18,
+    bottom: 2,
+    left: 8.5,
+    width: 1,
+    backgroundColor: BREW_THEME.edge,
+  },
+  stepNumCircle: {
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: BREW_THEME.soft,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: BREW_THEME.panel,
+  },
+  stepNumCircleActive: {
+    backgroundColor: BREW_THEME.cobalt,
+    borderColor: BREW_THEME.cobalt,
+  },
+  stepNumCircleDone: {
+    borderColor: BREW_THEME.acid,
+  },
+  stepNumText: {
+    color: BREW_THEME.soft,
+    fontSize: 8,
+    fontWeight: '800',
+  },
+  stepNumTextActive: {
+    color: '#ffffff',
+  },
+  stepNumTextDone: {
+    color: BREW_THEME.acid,
+  },
+  stepTextBlock: {
+    flex: 1,
+  },
+  stepTitle: {
+    color: BREW_THEME.oatmeal,
+    fontSize: 10,
+    fontWeight: '800',
+    letterSpacing: 0.6,
+    marginBottom: 2,
+  },
+  stepTitleActive: {
+    color: BREW_THEME.ivory,
+  },
+  stepSub: {
+    color: BREW_THEME.soft,
+    fontSize: 8.5,
+    lineHeight: 12,
+  },
+  stepSubActive: {
+    color: BREW_THEME.oatmeal,
+  },
+  inspBottom: {
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderTopWidth: 1,
+    borderTopColor: BREW_THEME.edge,
+    backgroundColor: BREW_THEME.inspBottomBg,
+  },
+  utilityRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
+  },
+  inspBottomLabel: {
+    color: BREW_THEME.soft,
+    fontSize: 8.5,
+    fontWeight: '800',
+    letterSpacing: 1.2,
+  },
+  guideToggleButton: {
+    backgroundColor: BREW_THEME.oatmeal,
+    borderWidth: 1,
+    borderColor: BREW_THEME.oatmealEdge,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 2,
+  },
+  guideToggleButtonText: {
+    color: BREW_THEME.oatmealInk,
+    fontSize: 8,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+  frequencyRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 2.5,
+    height: 22,
+    marginVertical: 6,
+  },
+  frequencyBar: {
+    width: 4,
+    backgroundColor: BREW_THEME.oatmeal,
+    borderRadius: 1,
+  },
+  audioStatusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  audioStatusLeft: {
+    color: BREW_THEME.soft,
+    fontSize: 8.5,
+    fontWeight: '700',
+    letterSpacing: 0.7,
+  },
+  audioStatusRight: {
+    color: BREW_THEME.acid,
+    fontSize: 8.5,
+    fontWeight: '800',
   },
 });

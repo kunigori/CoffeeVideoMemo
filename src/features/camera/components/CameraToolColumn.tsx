@@ -3,7 +3,7 @@ import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import type { CaptureWorkflowMode } from '../constants';
 import type { ExposureLockState } from '../services/exposureLockService';
 
-export type FlyoutType = 'mode' | 'ae' | null;
+export type FlyoutType = 'mode' | 'bright' | 'flicker' | null;
 
 export interface CameraToolColumnProps {
   captureMode: CaptureWorkflowMode;
@@ -12,7 +12,6 @@ export interface CameraToolColumnProps {
   isStopping: boolean;
   canRecord: boolean;
   aeLockState: ExposureLockState;
-  exposureEv: number;
   onToggleFlyout: (flyout: Exclude<FlyoutType, null>) => void;
   onToggleRecording: () => void;
 }
@@ -20,7 +19,11 @@ export interface CameraToolColumnProps {
 /**
  * 2列目: CameraToolColumn（幅 約76px）
  * 1列目のすぐ隣に独立した列として配置。背景は #0f0f0f。
- * 「モード」「REC」「AE」の3つのみ有効とし、他はレイアウト維持用の仮アイコン（opacity: 0.3、タップ無効）。
+ * 上から順に：
+ *  1. MODE / フル工程（または抽出のみ）
+ *  2. Bright / 明るさ
+ *  3. flicker / ちらつき防止
+ *  4. RECボタン（大型の白い外枠＋赤丸）
  */
 export function CameraToolColumn({
   captureMode,
@@ -29,53 +32,78 @@ export function CameraToolColumn({
   isStopping,
   canRecord,
   aeLockState,
-  exposureEv,
   onToggleFlyout,
   onToggleRecording,
 }: CameraToolColumnProps): React.JSX.Element {
-  const isModeFlyoutOpen = activeFlyout === 'mode';
-  const isAeFlyoutOpen = activeFlyout === 'ae';
+  const isModeOpen = activeFlyout === 'mode';
+  const isBrightOpen = activeFlyout === 'bright';
+  const isFlickerOpen = activeFlyout === 'flicker';
   const isAeLocked = aeLockState === 'locked';
   const recDisabled = isStopping || (!isRecording && !canRecord);
 
-  const formattedEv =
-    exposureEv > 0 ? `+${exposureEv.toFixed(1)}` : exposureEv.toFixed(1);
-
   return (
     <View style={styles.columnContainer}>
-      {/* 上部1: 「モード切替」ボタン（有効：フル工程 / 抽出のみ） */}
-      <TouchableOpacity
-        accessibilityRole="button"
-        accessibilityLabel="モード切替"
-        style={[
-          styles.toolButton,
-          isModeFlyoutOpen && styles.toolButtonActive,
-        ]}
-        onPress={() => onToggleFlyout('mode')}>
-        <Text style={styles.toolCaption}>MODE</Text>
-        <Text
+      <View style={styles.topButtonsGroup}>
+        {/* 1. MODE / フル工程 */}
+        <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="モード切替"
+          style={[styles.toolButton, isModeOpen && styles.toolButtonActive]}
+          onPress={() => onToggleFlyout('mode')}>
+          <Text style={styles.toolCaption}>MODE</Text>
+          <Text
+            style={[styles.toolValue, isModeOpen && styles.toolValueActive]}
+            numberOfLines={1}>
+            {captureMode === 'full-process' ? 'フル工程' : '抽出のみ'}
+          </Text>
+        </TouchableOpacity>
+
+        {/* 2. Bright / 明るさ */}
+        <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="明るさの自動調整・固定メニュー"
           style={[
-            styles.toolValue,
-            isModeFlyoutOpen && styles.toolValueActive,
+            styles.toolButton,
+            isBrightOpen && styles.toolButtonActive,
+            isAeLocked && !isBrightOpen && styles.toolButtonLocked,
           ]}
-          numberOfLines={1}>
-          {captureMode === 'full-process' ? 'フル工程' : '抽出のみ'}
-        </Text>
-      </TouchableOpacity>
+          onPress={() => onToggleFlyout('bright')}>
+          <View style={styles.captionRow}>
+            <Text style={styles.toolCaption}>Bright</Text>
+            {isAeLocked ? <Text style={styles.lockedDot}>●</Text> : null}
+          </View>
+          <Text
+            style={[
+              styles.toolValue,
+              isBrightOpen && styles.toolValueActive,
+              isAeLocked && !isBrightOpen && styles.toolValueLocked,
+            ]}>
+            明るさ
+          </Text>
+        </TouchableOpacity>
 
-      {/* 上部2: 仮アイコン（ダミー） */}
-      <View style={[styles.toolButton, styles.dummySlot]} pointerEvents="none">
-        <Text style={styles.toolCaption}>LUT</Text>
-        <Text style={styles.toolValue}>OFF</Text>
+        {/* 3. flicker / ちらつき防止 */}
+        <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="画面のちらつき防止メニュー"
+          style={[
+            styles.toolButton,
+            styles.toolButtonTall,
+            isFlickerOpen && styles.toolButtonActive,
+          ]}
+          onPress={() => onToggleFlyout('flicker')}>
+          <Text style={styles.toolCaption}>flicker</Text>
+          <Text
+            style={[
+              styles.toolValueMultiline,
+              isFlickerOpen && styles.toolValueActive,
+            ]}>
+            {'ちらつき\n防止'}
+          </Text>
+        </TouchableOpacity>
       </View>
 
-      {/* 上部3: 仮アイコン（ダミー） */}
-      <View style={[styles.toolButton, styles.dummySlot]} pointerEvents="none">
-        <Text style={styles.toolCaption}>ZEBRA</Text>
-        <Text style={styles.toolValue}>OFF</Text>
-      </View>
-
-      {/* 中央: 大型の白い外枠＋赤丸の「RECボタン」（有効：録画開始/停止） */}
+      {/* 中央〜下部: 大型の白い外枠＋赤丸の「RECボタン」（有効：録画開始/停止） */}
       <View style={styles.recSlot}>
         <TouchableOpacity
           accessibilityRole="button"
@@ -95,36 +123,6 @@ export function CameraToolColumn({
           />
         </TouchableOpacity>
       </View>
-
-      {/* 下部1: 「AE（露出ロック・補正）」ボタン（有効：AEロックON/OFFおよび露出調整） */}
-      <TouchableOpacity
-        accessibilityRole="button"
-        accessibilityLabel="AEロック・露出補正メニュー"
-        style={[
-          styles.toolButton,
-          isAeFlyoutOpen && styles.toolButtonActive,
-          isAeLocked && styles.toolButtonLocked,
-        ]}
-        onPress={() => onToggleFlyout('ae')}>
-        <View style={styles.aeHeaderRow}>
-          <Text style={styles.toolCaption}>AE</Text>
-          {isAeLocked ? <Text style={styles.lockBadge}>LOCK</Text> : null}
-        </View>
-        <Text
-          style={[
-            styles.toolValue,
-            isAeFlyoutOpen && styles.toolValueActive,
-            isAeLocked && styles.toolValueLocked,
-          ]}>
-          {formattedEv} EV
-        </Text>
-      </TouchableOpacity>
-
-      {/* 下部2: 仮アイコン（ダミー） */}
-      <View style={[styles.toolButton, styles.dummySlot]} pointerEvents="none">
-        <Text style={styles.toolCaption}>FOCUS</Text>
-        <Text style={styles.toolValue}>AF-C</Text>
-      </View>
     </View>
   );
 }
@@ -135,13 +133,18 @@ const styles = StyleSheet.create({
     backgroundColor: '#0f0f0f',
     borderRightWidth: 1,
     borderRightColor: '#1f1f1f',
-    paddingVertical: 8,
+    paddingVertical: 10,
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  topButtonsGroup: {
+    alignItems: 'center',
+    gap: 8,
+    width: '100%',
+  },
   toolButton: {
-    width: 62,
-    height: 44,
+    width: 64,
+    minHeight: 48,
     borderRadius: 8,
     backgroundColor: '#171717',
     borderWidth: 1,
@@ -149,48 +152,54 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 4,
+    paddingVertical: 5,
     gap: 2,
+  },
+  toolButtonTall: {
+    minHeight: 56,
   },
   toolButtonActive: {
     backgroundColor: '#0a2540',
     borderColor: '#2b84ea',
   },
   toolButtonLocked: {
-    borderColor: '#2b84ea',
+    borderColor: '#30d158',
   },
-  dummySlot: {
-    opacity: 0.3,
+  captionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 3,
+  },
+  lockedDot: {
+    color: '#30d158',
+    fontSize: 7,
   },
   toolCaption: {
     color: '#8e8e93',
     fontSize: 9,
     fontWeight: '700',
-    letterSpacing: 0.5,
+    letterSpacing: 0.3,
   },
   toolValue: {
     color: '#f2f2f7',
     fontSize: 11,
     fontWeight: '700',
-    fontVariant: ['tabular-nums'],
+  },
+  toolValueMultiline: {
+    color: '#f2f2f7',
+    fontSize: 10,
+    fontWeight: '700',
+    lineHeight: 13,
+    textAlign: 'center',
   },
   toolValueActive: {
     color: '#4da3ff',
   },
   toolValueLocked: {
-    color: '#4da3ff',
-  },
-  aeHeaderRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 3,
-  },
-  lockBadge: {
-    color: '#2b84ea',
-    fontSize: 8,
-    fontWeight: '800',
+    color: '#30d158',
   },
   recSlot: {
-    paddingVertical: 2,
+    paddingVertical: 6,
     alignItems: 'center',
     justifyContent: 'center',
   },

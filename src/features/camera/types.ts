@@ -1,3 +1,4 @@
+import type { VideoSyncedScaleLog } from '../../domain/timemoreScaleProtocol';
 import type { ExposureLockState } from './services/exposureLockService';
 
 /**
@@ -32,6 +33,8 @@ export interface RecordedVideoInfo {
   startedAtEpochMs: number;
   /** 録画完了時刻（epoch ms） */
   finishedAtEpochMs: number;
+  /** 録画開始時点（t=0）を基準としたスマートスケール（TES017）同期ログ */
+  scaleTelemetryLog?: VideoSyncedScaleLog;
 }
 
 /**

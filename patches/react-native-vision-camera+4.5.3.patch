@@ -211,12 +211,14 @@ diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/m
 diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraViewModule.kt b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraViewModule.kt
 --- a/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraViewModule.kt
 +++ b/node_modules/react-native-vision-camera/android/src/main/java/com/mrousavy/camera/react/CameraViewModule.kt
-@@ -1,9 +1,15 @@
+@@ -1,9 +1,18 @@
  package com.mrousavy.camera.react
  
  import android.Manifest
 +import android.content.ContentValues
  import android.content.pm.PackageManager
++import android.graphics.Bitmap
++import android.graphics.BitmapFactory
 +import android.os.Build
 +import android.os.Environment
 +import android.provider.MediaStore
@@ -224,10 +226,11 @@ diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/m
  import androidx.core.content.ContextCompat
 +import java.io.File
 +import java.io.FileInputStream
++import com.facebook.react.bridge.Arguments
  import com.facebook.react.bridge.Callback
  import com.facebook.react.bridge.Promise
  import com.facebook.react.bridge.ReactApplicationContext
-@@ -72,7 +78,9 @@
+@@ -72,7 +81,9 @@
        val uiManagerType = if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) UIManagerType.FABRIC else UIManagerType.DEFAULT
        val uiManager = UIManagerHelper.getUIManager(context, uiManagerType) ?: throw Error("UIManager not found!")
  
@@ -238,7 +241,7 @@ diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/m
        Log.d(TAG, "Found view $viewId!")
        return@runOnUiThreadAndWait view
      }
-@@ -189,6 +197,93 @@
+@@ -189,6 +200,182 @@
      }
    }
  
@@ -326,6 +329,95 @@ diff --git a/node_modules/react-native-vision-camera/android/src/main/java/com/m
 +      } catch (e: Throwable) {
 +        promise.reject("storage/save-failed", e.message ?: "ギャラリーへの動画保存に失敗しました。", e)
 +      }
++    }
++  }
++
++  @ReactMethod
++  fun recognizeTextInRegion(filePath: String, region: ReadableMap, promise: Promise) {
++    backgroundCoroutineScope.launch {
++      try {
++        val cleanPath = filePath.removePrefix("file://").trim()
++        val sourceFile = File(cleanPath)
++        if (!sourceFile.exists()) {
++          promise.reject("ocr/image-not-found", "OCR対象の画像ファイルが見つかりません: $cleanPath")
++          return@launch
++        }
++
++        val bitmap = BitmapFactory.decodeFile(cleanPath)
++        if (bitmap == null) {
++          promise.reject("ocr/invalid-image", "画像のデコードに失敗しました。")
++          return@launch
++        }
++
++        val rx = (if (region.hasKey("x")) region.getDouble("x") else 0.0).coerceIn(0.0, 1.0)
++        val ry = (if (region.hasKey("y")) region.getDouble("y") else 0.0).coerceIn(0.0, 1.0)
++        val rw = (if (region.hasKey("width")) region.getDouble("width") else 1.0).coerceIn(0.05, 1.0 - rx)
++        val rh = (if (region.hasKey("height")) region.getDouble("height") else 1.0).coerceIn(0.05, 1.0 - ry)
++
++        val cropX = (rx * bitmap.width).toInt().coerceIn(0, (bitmap.width - 1).coerceAtLeast(0))
++        val cropY = (ry * bitmap.height).toInt().coerceIn(0, (bitmap.height - 1).coerceAtLeast(0))
++        val cropW = (rw * bitmap.width).toInt().coerceIn(1, (bitmap.width - cropX).coerceAtLeast(1))
++        val cropH = (rh * bitmap.height).toInt().coerceIn(1, (bitmap.height - cropY).coerceAtLeast(1))
++
++        val cropped = Bitmap.createBitmap(bitmap, cropX, cropY, cropW, cropH)
++
++        try {
++          val inputImageClass = Class.forName("com.google.mlkit.vision.common.InputImage")
++          val fromBitmapMethod = inputImageClass.getMethod("fromBitmap", Bitmap::class.java, Int::class.javaPrimitiveType)
++          val inputImage = fromBitmapMethod.invoke(null, cropped, 0)
++
++          val textRecognitionClass = Class.forName("com.google.mlkit.vision.text.TextRecognition")
++          val optionsInterface = Class.forName("com.google.mlkit.vision.text.TextRecognizerOptionsInterface")
++          val japaneseBuilderClass = Class.forName("com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions\$Builder")
++          val optionsInstance = japaneseBuilderClass.getConstructor().newInstance()
++          val buildMethod = japaneseBuilderClass.getMethod("build")
++          val builtOptions = buildMethod.invoke(optionsInstance)
++
++          val getClientMethod = textRecognitionClass.getMethod("getClient", optionsInterface)
++          val recognizer = getClientMethod.invoke(null, builtOptions)
++          val processMethod = recognizer.javaClass.getMethod("process", inputImageClass)
++          val task = processMethod.invoke(recognizer, inputImage)
++
++          val tasksClass = Class.forName("com.google.android.gms.tasks.Tasks")
++          val awaitMethod = tasksClass.getMethod("await", Class.forName("com.google.android.gms.tasks.Task"))
++          val visionText = awaitMethod.invoke(null, task)
++
++          val getTextMethod = visionText.javaClass.getMethod("getText")
++          val fullText = (getTextMethod.invoke(visionText) as? String) ?: ""
++          val linesArray = Arguments.createArray()
++          fullText.lines().map { it.trim() }.filter { it.isNotEmpty() }.forEach { line ->
++            linesArray.pushString(line)
++          }
++
++          val response = Arguments.createMap().apply {
++            putString("engine", "mlkit-japanese")
++            putArray("lines", linesArray)
++            putString("fullText", fullText)
++          }
++          promise.resolve(response)
++        } catch (_: ClassNotFoundException) {
++          promise.reject(
++            "ocr/mlkit-not-linked",
++            "Android ML Kit TextRecognition (com.google.mlkit:text-recognition-japanese) がまだリンクされていません。"
++          )
++        }
++      } catch (e: Throwable) {
++        promise.reject("ocr/failed", e.message ?: "領域クロップ・OCR処理に失敗しました。", e)
++      }
++    }
++  }
++
++  @ReactMethod
++  fun getEquipmentModelStatus(promise: Promise) {
++    try {
++      val assetFiles = reactApplicationContext.assets.list("")?.toSet() ?: emptySet()
++      val map = Arguments.createMap().apply {
++        putBoolean("millModelBundled", assetFiles.contains("mill_classifier.tflite"))
++        putBoolean("dripperModelBundled", assetFiles.contains("dripper_classifier.tflite"))
++      }
++      promise.resolve(map)
++    } catch (e: Throwable) {
++      promise.reject("tflite/status-error", e.message ?: "TFLiteモデル状態の確認に失敗しました。", e)
 +    }
 +  }
 +
@@ -554,7 +646,7 @@ diff --git a/node_modules/react-native-vision-camera/ios/React/CameraView.swift 
 diff --git a/node_modules/react-native-vision-camera/ios/React/CameraViewManager.m b/node_modules/react-native-vision-camera/ios/React/CameraViewManager.m
 --- a/node_modules/react-native-vision-camera/ios/React/CameraViewManager.m
 +++ b/node_modules/react-native-vision-camera/ios/React/CameraViewManager.m
-@@ -103,5 +103,21 @@
+@@ -103,5 +103,29 @@
                    : (NSDictionary*)point resolve
                    : (RCTPromiseResolveBlock)resolve reject
                    : (RCTPromiseRejectBlock)reject);
@@ -574,20 +666,34 @@ diff --git a/node_modules/react-native-vision-camera/ios/React/CameraViewManager
 +                  : (nonnull NSString*)filePath resolve
 +                  : (RCTPromiseResolveBlock)resolve reject
 +                  : (RCTPromiseRejectBlock)reject);
++RCT_EXTERN_METHOD(recognizeTextInRegion
++                  : (nonnull NSString*)filePath region
++                  : (nonnull NSDictionary*)region resolve
++                  : (RCTPromiseResolveBlock)resolve reject
++                  : (RCTPromiseRejectBlock)reject);
++RCT_EXTERN_METHOD(getEquipmentModelStatus
++                  : (RCTPromiseResolveBlock)resolve reject
++                  : (RCTPromiseRejectBlock)reject);
  
  @end
 diff --git a/node_modules/react-native-vision-camera/ios/React/CameraViewManager.swift b/node_modules/react-native-vision-camera/ios/React/CameraViewManager.swift
 --- a/node_modules/react-native-vision-camera/ios/React/CameraViewManager.swift
 +++ b/node_modules/react-native-vision-camera/ios/React/CameraViewManager.swift
-@@ -11,6 +11,7 @@
+@@ -11,6 +11,13 @@
  import AVFoundation
  import CoreLocation
  import Foundation
 +import Photos
++import UIKit
++import Vision
++#if canImport(MLKitTextRecognitionJapanese) && canImport(MLKitVision)
++  import MLKitTextRecognitionJapanese
++  import MLKitVision
++#endif
  
  @objc(CameraViewManager)
  final class CameraViewManager: RCTViewManager {
-@@ -97,6 +98,89 @@
+@@ -97,6 +104,207 @@
    }
  
    @objc
@@ -674,10 +780,128 @@ diff --git a/node_modules/react-native-vision-camera/ios/React/CameraViewManager
 +  }
 +
 +  @objc
++  final func recognizeTextInRegion(
++    _ filePath: NSString,
++    region: NSDictionary,
++    resolve: @escaping RCTPromiseResolveBlock,
++    reject: @escaping RCTPromiseRejectBlock
++  ) {
++    DispatchQueue.global(qos: .userInitiated).async {
++      let rawPath = filePath as String
++      let fileURL: URL
++      if rawPath.hasPrefix("file://"), let parsed = URL(string: rawPath) {
++        fileURL = parsed
++      } else {
++        fileURL = URL(fileURLWithPath: rawPath)
++      }
++
++      guard FileManager.default.fileExists(atPath: fileURL.path),
++            let sourceImage = UIImage(contentsOfFile: fileURL.path) else {
++        reject("ocr/image-not-found", "OCR対象の画像ファイルが見つかりません: \(fileURL.path)", nil)
++        return
++      }
++
++      let normalizedImage = Self.normalizeImageOrientation(sourceImage)
++      guard let cgImage = normalizedImage.cgImage else {
++        reject("ocr/invalid-image", "画像のCGImage変換に失敗しました。", nil)
++        return
++      }
++
++      let rx = max(0.0, min(1.0, (region["x"] as? NSNumber)?.doubleValue ?? 0.0))
++      let ry = max(0.0, min(1.0, (region["y"] as? NSNumber)?.doubleValue ?? 0.0))
++      let rw = max(0.05, min(1.0 - rx, (region["width"] as? NSNumber)?.doubleValue ?? 1.0))
++      let rh = max(0.05, min(1.0 - ry, (region["height"] as? NSNumber)?.doubleValue ?? 1.0))
++
++      let imgWidth = Double(cgImage.width)
++      let imgHeight = Double(cgImage.height)
++      let cropRect = CGRect(
++        x: floor(rx * imgWidth),
++        y: floor(ry * imgHeight),
++        width: max(1.0, floor(rw * imgWidth)),
++        height: max(1.0, floor(rh * imgHeight))
++      )
++
++      guard let croppedCGImage = cgImage.cropping(to: cropRect) else {
++        reject("ocr/crop-failed", "指定領域（右ゾーン）のクロップに失敗しました。", nil)
++        return
++      }
++
++      #if canImport(MLKitTextRecognitionJapanese) && canImport(MLKitVision)
++        let croppedUIImage = UIImage(cgImage: croppedCGImage)
++        let visionImage = VisionImage(image: croppedUIImage)
++        visionImage.orientation = .up
++        let options = JapaneseTextRecognizerOptions()
++        let recognizer = TextRecognizer.textRecognizer(options: options)
++        recognizer.process(visionImage) { result, error in
++          if let error = error {
++            reject("ocr/mlkit-failed", error.localizedDescription, error)
++            return
++          }
++          let lines: [String] = result?.blocks.flatMap { $0.lines.map { $0.text } } ?? []
++          resolve([
++            "engine": "mlkit-japanese",
++            "lines": lines,
++            "fullText": result?.text ?? lines.joined(separator: "\n"),
++          ])
++        }
++      #else
++        let request = VNRecognizeTextRequest { req, error in
++          if let error = error {
++            reject("ocr/vision-failed", error.localizedDescription, error)
++            return
++          }
++          let observations = (req.results as? [VNRecognizedTextObservation]) ?? []
++          let lines: [String] = observations.compactMap { $0.topCandidates(1).first?.string }
++          resolve([
++            "engine": "ios-vision",
++            "lines": lines,
++            "fullText": lines.joined(separator: "\n"),
++          ])
++        }
++        request.recognitionLevel = .accurate
++        request.usesLanguageCorrection = true
++        request.recognitionLanguages = ["ja-JP", "en-US"]
++
++        let handler = VNImageRequestHandler(cgImage: croppedCGImage, options: [:])
++        do {
++          try handler.perform([request])
++        } catch {
++          reject("ocr/vision-failed", error.localizedDescription, error)
++        }
++      #endif
++    }
++  }
++
++  @objc
++  final func getEquipmentModelStatus(
++    _ resolve: @escaping RCTPromiseResolveBlock,
++    reject _: @escaping RCTPromiseRejectBlock
++  ) {
++    let millPath = Bundle.main.path(forResource: "mill_classifier", ofType: "tflite")
++    let dripperPath = Bundle.main.path(forResource: "dripper_classifier", ofType: "tflite")
++    resolve([
++      "millModelBundled": millPath != nil,
++      "dripperModelBundled": dripperPath != nil,
++    ])
++  }
++
++  private static func normalizeImageOrientation(_ image: UIImage) -> UIImage {
++    if image.imageOrientation == .up {
++      return image
++    }
++    let format = UIGraphicsImageRendererFormat()
++    format.scale = 1.0
++    let renderer = UIGraphicsImageRenderer(size: image.size, format: format)
++    return renderer.image { _ in
++      image.draw(in: CGRect(origin: .zero, size: image.size))
++    }
++  }
++
++  @objc
    final func getCameraPermissionStatus() -> String {
      let status = AVCaptureDevice.authorizationStatus(for: .video)
      return status.descriptor
-@@ -147,7 +231,17 @@
+@@ -147,7 +355,17 @@
  
    // MARK: Private
  

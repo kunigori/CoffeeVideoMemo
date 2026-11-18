@@ -33,6 +33,10 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>タイムモア スマートスケール（Black Mirror Dot / TES017）とBLE接続し、抽出重量・流速をリアルタイム記録するためにBluetoothを使用します。</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>タイムモア スマートスケール（TES017）と接続して抽出データを取得するためにBluetoothを使用します。</string>
 	<key>NSCameraUsageDescription</key>
 	<string>コーヒー抽出動画の撮影およびパッケージ認識にカメラを使用します。</string>
 	<key>NSLocationWhenInUseUsageDescription</key>

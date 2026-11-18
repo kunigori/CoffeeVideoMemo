@@ -93,7 +93,7 @@ shared       → 外側のアプリ固有層に依存しない
 
 ## 4. ディレクトリ構成
 
-### 4.1 現在の実装構成（Sprint 1 時点）
+### 4.1 現在の実装構成（Sprint 1〜Sprint 2/3 先行基盤）
 
 必要のない空ディレクトリや未使用のプレースホルダーファイルは作成せず、実装済みの機能のみを配置している。
 
@@ -107,34 +107,46 @@ CoffeeVideoMemo/
 ├── tsconfig.json
 ├── babel.config.js
 ├── patches/
-│   └── react-native-vision-camera+4.5.3.patch      # VisionCamera v4 へのAEロック・写真保存パッチ
+│   └── react-native-vision-camera+4.5.3.patch      # VisionCamera v4 へのAEロック・写真保存・右領域クロップOCRパッチ
 ├── ios/                                            # iOSネイティブプロジェクト
 ├── android/                                        # Androidネイティブプロジェクト
 ├── src/
+│   ├── domain/                                     # 機能横断の純粋ドメインロジック・モデル
+│   │   ├── beanCatalog.json                        # スペシャルティコーヒー豆マスタデータ
+│   │   ├── beanMatcher.ts                          # OCR誤読補正 + 2段階ファジー照合（ロースター絞り込み → 農園・産地スコア）
+│   │   └── timemoreScaleProtocol.ts                # Timemore Black Mirror Dot (TES017) BLEフレームデコーダ・CRC検証・移動平均流速・動画同期ログ
 │   └── features/
-│       └── camera/                                 # カメラ撮影機能モジュール（実装済み）
+│       └── camera/                                 # カメラ撮影機能モジュール
 │           ├── screens/
 │           │   └── CameraScreen.tsx
 │           ├── components/
 │           │   ├── MainNavRail.tsx
 │           │   ├── CameraToolColumn.tsx
 │           │   ├── OptionFlyoutOverlay.tsx
+│           │   ├── PlacementGuideOverlay.tsx       # 3分割配置ガイドUI（左:ミル / 中央:ドリッパー・スケール / 右:豆袋）
 │           │   ├── TopStatusHud.tsx
 │           │   ├── BottomBrewHud.tsx
 │           │   └── RecordingControls.tsx
 │           ├── hooks/
 │           │   ├── useCameraConfig.ts              # 4K・30fps固定フォーマット選択・カメラ状態管理
-│           │   └── useExposureLock.ts              # AEロックのUI向け7状態管理
+│           │   ├── useExposureLock.ts              # AEロックのUI向け7状態管理
+│           │   └── useTimemoreScale.ts             # TES017 10Hz受信Ref分離・150msスロットリングUI更新・REC同期記録
 │           ├── services/
 │           │   ├── exposureLockService.ts          # AEロック共通API（ネイティブ連携）
-│           │   └── recordingService.ts             # 録画開始/停止・30fpsタイムコード・写真フォルダ保存
-│           ├── constants.ts                        # TARGET_FPS=30、4K解像度、EV/シャッター定数
+│           │   ├── recordingService.ts             # 録画開始/停止・30fpsタイムコード・写真フォルダ保存
+│           │   ├── beanOcrService.ts               # 静止画撮影 + 右枠クロップオンデバイスOCR + 豆ファジー推論
+│           │   ├── equipmentInferenceService.ts    # パターンA 2モデルTFLite（mill_classifier / dripper_classifier）境界
+│           │   └── timemoreScaleService.ts         # TES017 BLEスキャン(0xFFF0)・ハンドシェイク(0xFFF2)・Notify(0xFFF1)・Tare送信
+│           ├── constants.ts                        # TARGET_FPS=30、4K解像度、3分割配置ゾーン座標定義
 │           └── types.ts                            # カメラ録画状態・録画ファイルメタデータ型
 └── __tests__/
     ├── App.test.tsx
+    ├── beanMatcher.test.ts
+    ├── beanOcrService.test.ts
     ├── cameraConfig.test.ts
     ├── exposureLock.test.ts
-    └── recordingService.test.ts
+    ├── recordingService.test.ts
+    └── timemoreScale.test.ts
 ```
 
 `App.tsx`、`ios/`、`android/`、`patches/`、ビルド設定・テスト設定は `src/` 配下への配置ルールの**例外**とする。

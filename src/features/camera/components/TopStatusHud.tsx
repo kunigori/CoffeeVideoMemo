@@ -1,7 +1,8 @@
 import React from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import {
-  SHUTTER_SPEED_OPTIONS,
+  BREW_THEME,
+  FLICKER_PRESET_OPTIONS,
   ShutterSpeedLabel,
   TARGET_FPS,
 } from '../constants';
@@ -11,109 +12,102 @@ import { formatTimecode30Fps } from '../services/recordingService';
 export interface TopStatusHudProps {
   elapsedMs: number;
   isRecording: boolean;
+  activeStageIndex: 0 | 1 | 2;
   shutterSpeed: ShutterSpeedLabel;
   aeLockState: ExposureLockState;
-  exposureEv: number;
   videoWidth?: number;
   videoHeight?: number;
-  onCycleShutterSpeed: () => void;
+  onCycleBrewPhase?: () => void;
+  onPressBrightnessBadge?: () => void;
+  onPressFlickerBadge?: () => void;
 }
 
 /**
- * 上部HUD: TopStatusHud
- * Blackmagic Camera 準拠のトップステータスバー。
- * LENS, FPS: 30, SHUTTER: 1/60 (1/50, 1/60, 1/100 対応), IRIS,
- * 中央に大きな等幅フォントのタイムコード (00:00:00:00), ISO, WB, 4K 16:9 バッジを表示。
+ * TOP HEADER: TopStatusHud
+ * pour_frame_side_view_edition (2).html の <header class="top"> を忠実に再現：
+ * - 左: Brand (Oatmeal Mark + COFFEE VIDEO MEMO / BREW MOTION SYSTEM • 01)
+ * - 中央: State Pill (● 抽出 : 1投目 / ● REC : 1投目) + Timecode (00:00:00:00)
+ * - 右: Synchronized Camera Specs (BRIGHT / FLICKER / FRAME RATE: 30 FPS / FORMAT: 4K / 16:9)
  */
 export function TopStatusHud({
   elapsedMs,
-  isRecording,
   shutterSpeed,
   aeLockState,
-  exposureEv,
-  videoWidth,
-  videoHeight,
-  onCycleShutterSpeed,
+  onPressBrightnessBadge,
+  onPressFlickerBadge,
 }: TopStatusHudProps): React.JSX.Element {
-  const timecode = formatTimecode30Fps(elapsedMs);
+  const fullTimecode = formatTimecode30Fps(elapsedMs);
+  const mainTime = fullTimecode.slice(0, 8);
+  const subFrames = fullTimecode.slice(8);
+
   const isLocked = aeLockState === 'locked';
-  const evText =
-    exposureEv > 0 ? `+${exposureEv.toFixed(1)}` : exposureEv.toFixed(1);
-  const resolutionBadge =
-    videoWidth === 3840 && videoHeight === 2160
-      ? '4K 16:9'
-      : videoWidth && videoHeight
-        ? `4K 16:9 (${videoWidth}x${videoHeight})`
-        : '4K 16:9';
+
+  const flickerPreset =
+    FLICKER_PRESET_OPTIONS.find(item => item.shutter === shutterSpeed) ??
+    FLICKER_PRESET_OPTIONS[0];
 
   return (
-    <View style={styles.hudBar}>
-      {/* 左側カメラパラメータ群 */}
-      <View style={styles.metricsGroup}>
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>LENS</Text>
-          <Text style={styles.metricValue}>24mm</Text>
+    <View style={styles.topHeader}>
+      {/* Left: Brand Title (アイコンなし) */}
+      <View style={styles.brand}>
+        <View>
+          <Text style={styles.brandName} numberOfLines={1}>
+            COFFEE VIDEO MEMO
+          </Text>
+          <Text style={styles.brandSub} numberOfLines={1}>
+            BREW MOTION SYSTEM  •  01
+          </Text>
         </View>
+      </View>
 
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>FPS</Text>
-          <Text style={styles.metricValue}>FPS: {TARGET_FPS}</Text>
+      {/* Center: Timer Only (何投目かのピルは右インスペクターで確認できるため非表示) */}
+      <View style={styles.timerBar}>
+        <View style={styles.timeWrapper}>
+          <Text style={styles.timeMain}>{mainTime}</Text>
+          <Text style={styles.timeSmall}>{subFrames}</Text>
         </View>
+      </View>
 
+      {/* Right: Synchronized Camera Specs */}
+      <View style={styles.specs}>
         <TouchableOpacity
           accessibilityRole="button"
-          accessibilityLabel={`シャッタースピード切替 (${SHUTTER_SPEED_OPTIONS.join(', ')})`}
-          style={styles.metricBlockInteractive}
-          onPress={onCycleShutterSpeed}>
-          <Text style={styles.metricLabel}>SHUTTER</Text>
-          <Text style={styles.metricValueHighlight}>
-            SHUTTER: {shutterSpeed}
+          accessibilityLabel="BRIGHT 切替"
+          activeOpacity={0.75}
+          style={styles.specPill}
+          onPress={onPressBrightnessBadge}>
+          <Text style={styles.specKey}>BRIGHT</Text>
+          <Text
+            style={[
+              styles.specVal,
+              isLocked && styles.specValSpecial,
+            ]}>
+            {isLocked ? '☀ AE LOCK' : '☀ AUTO'}
           </Text>
         </TouchableOpacity>
 
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>IRIS</Text>
-          <Text style={styles.metricValue}>f/1.8</Text>
-        </View>
-      </View>
+        <TouchableOpacity
+          accessibilityRole="button"
+          accessibilityLabel="FLICKER 切替"
+          activeOpacity={0.75}
+          style={styles.specPill}
+          onPress={onPressFlickerBadge}>
+          <Text style={styles.specKey}>FLICKER</Text>
+          <Text style={styles.specVal}>💡 {flickerPreset.shortHzLabel}</Text>
+        </TouchableOpacity>
 
-      {/* 中央: 大きな等幅フォントのタイムコード (00:00:00:00) */}
-      <View style={styles.timecodeContainer}>
-        <View
-          style={[
-            styles.recDot,
-            isRecording ? styles.recDotActive : styles.recDotIdle,
-          ]}
-        />
-        <Text
-          style={[
-            styles.timecodeText,
-            isRecording && styles.timecodeTextRecording,
-          ]}>
-          {timecode}
-        </Text>
-      </View>
+        <View style={styles.separator} />
 
-      {/* 右側センサー・フォーマットバッジ群 */}
-      <View style={styles.metricsGroupRight}>
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>ISO / AE</Text>
-          <Text
-            style={[
-              styles.metricValue,
-              isLocked && styles.metricValueLocked,
-            ]}>
-            {isLocked ? `LOCK (${evText})` : `AUTO (${evText})`}
-          </Text>
+        <View style={styles.specPlain}>
+          <Text style={styles.specKey}>FRAME RATE</Text>
+          <Text style={styles.specVal}>{TARGET_FPS} FPS</Text>
         </View>
 
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>WB</Text>
-          <Text style={styles.metricValue}>5600K</Text>
-        </View>
+        <View style={styles.separator} />
 
-        <View style={styles.formatBadge}>
-          <Text style={styles.formatBadgeText}>{resolutionBadge}</Text>
+        <View style={styles.specPlain}>
+          <Text style={styles.specKey}>FORMAT</Text>
+          <Text style={[styles.specVal, styles.specValSpecial]}>4K / 16:9</Text>
         </View>
       </View>
     </View>
@@ -121,102 +115,93 @@ export function TopStatusHud({
 }
 
 const styles = StyleSheet.create({
-  hudBar: {
+  topHeader: {
+    height: 52,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: 'rgba(8, 8, 8, 0.78)',
+    backgroundColor: BREW_THEME.topBarBg,
     borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255, 255, 255, 0.12)',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
+    borderBottomColor: BREW_THEME.edge,
+    paddingHorizontal: 16,
   },
-  metricsGroup: {
+  brand: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
   },
-  metricsGroupRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
+  brandName: {
+    color: BREW_THEME.ivory,
+    fontSize: 13,
+    fontWeight: '800',
+    letterSpacing: 1.2,
   },
-  metricBlock: {
-    alignItems: 'flex-start',
-  },
-  metricBlockInteractive: {
-    alignItems: 'flex-start',
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-    backgroundColor: 'rgba(43, 132, 234, 0.16)',
-    borderWidth: 1,
-    borderColor: 'rgba(43, 132, 234, 0.45)',
-  },
-  metricLabel: {
-    color: '#8e8e93',
+  brandSub: {
+    color: BREW_THEME.soft,
     fontSize: 8,
     fontWeight: '700',
-    letterSpacing: 0.5,
+    letterSpacing: 1.4,
+    marginTop: 2,
   },
-  metricValue: {
-    color: '#f2f2f7',
-    fontSize: 11,
-    fontWeight: '700',
-    fontVariant: ['tabular-nums'],
-  },
-  metricValueHighlight: {
-    color: '#64d2ff',
-    fontSize: 11,
-    fontWeight: '800',
-    fontVariant: ['tabular-nums'],
-  },
-  metricValueLocked: {
-    color: '#30d158',
-  },
-  timecodeContainer: {
+  timerBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 10,
-    paddingVertical: 2,
-    borderRadius: 6,
-    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    justifyContent: 'center',
   },
-  recDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
+  timeWrapper: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
   },
-  recDotIdle: {
-    backgroundColor: '#636366',
-  },
-  recDotActive: {
-    backgroundColor: '#ff3b30',
-  },
-  timecodeText: {
-    color: '#ffffff',
-    fontSize: 20,
+  timeMain: {
+    color: BREW_THEME.ivory,
+    fontSize: 24,
     fontWeight: '800',
     fontFamily: 'Courier',
     fontVariant: ['tabular-nums'],
-    letterSpacing: 1,
+    letterSpacing: 1.5,
   },
-  timecodeTextRecording: {
-    color: '#ff453a',
-  },
-  formatBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 4,
-    backgroundColor: '#1c1c1e',
-    borderWidth: 1,
-    borderColor: '#3a3a3c',
-  },
-  formatBadgeText: {
-    color: '#ffd60a',
+  timeSmall: {
+    color: BREW_THEME.soft,
     fontSize: 10,
+    fontWeight: '700',
+    fontFamily: 'Courier',
+    fontVariant: ['tabular-nums'],
+    marginLeft: 4,
+  },
+  specs: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  specPill: {
+    backgroundColor: BREW_THEME.panel2,
+    borderWidth: 1,
+    borderColor: BREW_THEME.edge,
+    borderRadius: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+  },
+  specPlain: {
+    justifyContent: 'center',
+  },
+  specKey: {
+    color: BREW_THEME.soft,
+    fontSize: 7.5,
+    fontWeight: '700',
+    letterSpacing: 1,
+    marginBottom: 1,
+  },
+  specVal: {
+    color: BREW_THEME.ivory,
+    fontSize: 10.5,
     fontWeight: '800',
-    letterSpacing: 0.4,
+    fontVariant: ['tabular-nums'],
+  },
+  specValSpecial: {
+    color: BREW_THEME.acid,
+  },
+  separator: {
+    width: 1,
+    height: 20,
+    backgroundColor: BREW_THEME.edge,
   },
 });
